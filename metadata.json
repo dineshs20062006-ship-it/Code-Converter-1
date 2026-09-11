@@ -1,0 +1,7 @@
+{
+  "name": "Code Converter",
+  "description": "An intelligent, multimodal Code Converter and polyglot architecture translator with automated tech stack analysis, multimodal visual styling, and sandboxed live execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
