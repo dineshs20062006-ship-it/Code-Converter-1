@@ -6,9 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from backend.services.aiagent import AIAgentService
-from backend.services.sandbox import SandboxExecutionService
-from backend.services.translationloop import AgenticTranslationLoop, TranslationLoopResult, DebugStep
+from services.aiagent import AIAgentService
+from services.sandbox import SandboxExecutionService
+from services.translationloop import AgenticTranslationLoop, TranslationLoopResult, DebugStep
 
 # Load environment variables from backend directory and root
 _backend_dir = pathlib.Path(__file__).resolve().parent
@@ -240,4 +240,4 @@ async def export_zip(payload: ExportZipRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=3000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=3000, reload=True)

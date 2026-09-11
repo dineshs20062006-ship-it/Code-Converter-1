@@ -1,8 +1,12 @@
 import time
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
-from backend.services.aiagent import AIAgentService
-from backend.services.sandbox import SandboxExecutionService
+try:
+    from services.aiagent import AIAgentService
+    from services.sandbox import SandboxExecutionService
+except ImportError:
+    from backend.services.aiagent import AIAgentService
+    from backend.services.sandbox import SandboxExecutionService
 
 
 class DebugStep(BaseModel):
