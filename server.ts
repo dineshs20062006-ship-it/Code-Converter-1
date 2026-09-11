@@ -3,33 +3,113 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
-import { detectProjectLanguage, reconcileTargetScaffold } from "./src/lib/languages";
+import { detectProjectLanguage, reconcileTargetScaffold } from "./src/lib/languages.ts";
 
 // Explicitly load .env file
 dotenv.config();
 
 const PORT = 3000;
 
-function getGeminiClient(customApiKey?: string): GoogleGenAI {
-  const rawKey = (
-    customApiKey ||
-    process.env.GEMINI_API_KEY ||
-    process.env.VITE_GEMINI_API_KEY ||
-    ""
-  ).replace(/^["']|["']$/g, "").trim();
-  if (!rawKey) {
-    const err: any = new Error("API Key is missing. Please enter your Gemini API Key in the top navigation bar.");
-    err.status = 401;
-    throw err;
+let cachedWorkingApiKey: string | null = null;
+
+function getCandidateApiKeys(customApiKey?: string): string[] {
+  const keys: string[] = [];
+  if (customApiKey && typeof customApiKey === "string" && customApiKey.trim()) {
+    const k = customApiKey.replace(/^["']|["']$/g, "").trim();
+    if (k) keys.push(k);
   }
-  
-  // Explicitly remove any Google Cloud / Vertex AI credentials that might cause OAuth fallback
+  if (cachedWorkingApiKey && !keys.includes(cachedWorkingApiKey)) {
+    keys.push(cachedWorkingApiKey);
+  }
+
+  // Check VITE_GEMINI_API_KEY and GEMINI_API_KEY
+  // Prioritize VITE_GEMINI_API_KEY because AI Studio client secrets are often mapped to VITE_ keys
+  const viteKey = (process.env.VITE_GEMINI_API_KEY || "").replace(/^["']|["']$/g, "").trim();
+  const envKey = (process.env.GEMINI_API_KEY || "").replace(/^["']|["']$/g, "").trim();
+
+  if (viteKey && !keys.includes(viteKey)) {
+    keys.push(viteKey);
+  }
+  if (envKey && !keys.includes(envKey)) {
+    keys.push(envKey);
+  }
+
+  return keys;
+}
+
+function createGeminiClientWithKey(apiKey: string): GoogleGenAI {
   delete process.env.GOOGLE_GENAI_USE_VERTEXAI;
   delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
 
   return new GoogleGenAI({
-    apiKey: rawKey,
+    apiKey,
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
   });
+}
+
+function getGeminiClient(customApiKey?: string): GoogleGenAI {
+  const candidates = getCandidateApiKeys(customApiKey);
+  if (candidates.length === 0) {
+    const err: any = new Error("Gemini API Key is required. Please set your Gemini API Key in the application settings.");
+    err.status = 401;
+    throw err;
+  }
+  return createGeminiClientWithKey(candidates[0]);
+}
+
+async function generateContentWithFailover(
+  customApiKey: string | undefined,
+  params: {
+    model?: string;
+    contents: any;
+    config?: any;
+  }
+): Promise<any> {
+  const candidateKeys = getCandidateApiKeys(customApiKey);
+  if (candidateKeys.length === 0) {
+    const err: any = new Error("Gemini API Key is required. Please ensure your Gemini API Key is configured in environment settings.");
+    err.status = 401;
+    throw err;
+  }
+
+  const model = params.model || resolveGeminiModel();
+  let lastErr: any = null;
+
+  for (let i = 0; i < candidateKeys.length; i++) {
+    const key = candidateKeys[i];
+    try {
+      const client = createGeminiClientWithKey(key);
+      const res = await client.models.generateContent({
+        model,
+        contents: params.contents,
+        ...(params.config ? { config: params.config } : {}),
+      });
+      cachedWorkingApiKey = key;
+      return res;
+    } catch (err: any) {
+      lastErr = err;
+      const errMsg = String(err?.message || err || "");
+      const isAuthErr =
+        err?.status === 401 ||
+        errMsg.includes("401") ||
+        errMsg.includes("UNAUTHENTICATED") ||
+        errMsg.includes("ACCESS_TOKEN_TYPE_UNSUPPORTED") ||
+        errMsg.includes("API_KEY_INVALID") ||
+        errMsg.includes("API key not valid");
+
+      if (isAuthErr && i < candidateKeys.length - 1) {
+        console.info(`[Gemini Auth] Candidate key #${i + 1} rejected. Attempting fallback key #${i + 2}...`);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastErr;
 }
 
 interface ProjectFile {
@@ -505,23 +585,24 @@ function isTargetFrontendUI(targetFrontend?: string): boolean {
   return !tf.includes("none") && tf !== "none_cli";
 }
 
+function resolveGeminiModel(): string {
+  const raw = (process.env.GEMINI_MODEL || process.env.VITE_GEMINI_MODEL || "").trim();
+  if (raw.includes("3.8") || raw.includes("3.6")) {
+    return raw;
+  }
+  return "gemini-3.8-flash";
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: "25mb" }));
 
-  function resolveGeminiModel(): string {
-    const raw = process.env.GEMINI_MODEL || process.env.VITE_GEMINI_MODEL;
-    if (!raw || raw.includes("2.5-flash") || raw.includes("2.0-flash") || raw.includes("1.5-flash")) {
-      return "gemini-3.6-flash";
-    }
-    return raw;
-  }
-
   // API Routes
   app.get("/api/health", (req, res) => {
+    const hasKey = getCandidateApiKeys().length > 0;
     res.json({
       status: "healthy",
-      gemini_configured: !!process.env.GEMINI_API_KEY,
+      gemini_configured: hasKey,
       e2b_configured: !!process.env.E2B_API_KEY,
       model: resolveGeminiModel(),
     });
@@ -628,11 +709,11 @@ async function startServer() {
         ""
       ).toString().trim();
 
-      if (userApiKey || process.env.GEMINI_API_KEY) {
-        const ai = getGeminiClient(userApiKey);
-        const model = resolveGeminiModel();
-
-        const prompt = `You are a Principal Software Architect Analyzer.
+      const candidateKeys = getCandidateApiKeys(userApiKey);
+      if (candidateKeys.length > 0) {
+        try {
+          const model = resolveGeminiModel();
+          const prompt = `You are a Principal Software Architect Analyzer.
 Analyze the following project structure and configuration files to identify the exact technology stack.
 
 ### File Tree (${fileList.length} files):
@@ -652,16 +733,20 @@ Respond ONLY with valid JSON matching this schema:
 }
 `;
 
-        const response = await ai.models.generateContent({
-          model,
-          contents: prompt,
-        });
+          const response = await generateContentWithFailover(userApiKey, {
+            model,
+            contents: prompt,
+          });
 
-        const rawText = response.text || "";
-        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          analysis = JSON.parse(jsonMatch[0]);
-        } else {
+          const rawText = response?.text || "";
+          const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            analysis = JSON.parse(jsonMatch[0]);
+          } else {
+            analysis = heuristicAnalyzeProject(fileList);
+          }
+        } catch (aiErr: any) {
+          console.info("[Project Analyzer] AI stack analysis unavailable, using heuristic stack detector.");
           analysis = heuristicAnalyzeProject(fileList);
         }
       } else {
@@ -673,7 +758,7 @@ Respond ONLY with valid JSON matching this schema:
         analysis,
       });
     } catch (err: any) {
-      console.warn("Analyzer Gemini error, using heuristic fallback:", err.message);
+      console.info("[Project Analyzer] Using heuristic fallback analyzer.");
       const fallbackAnalysis = heuristicAnalyzeProject(fileList);
       return res.json({
         success: true,
@@ -700,11 +785,12 @@ Respond ONLY with valid JSON matching this schema:
       previewDescription,
       gemini_api_key,
       max_attempts = 3,
+      is_project = false,
       is_project_mode = false,
       isProjectMode = false,
     } = req.body;
 
-    const isProject = Boolean(is_project_mode || isProjectMode);
+    const isProject = Boolean(is_project || is_project_mode || isProjectMode);
     const userPreviewGuidance = (preview_description || previewDescription || "").trim();
     let instructions = conversion_instructions || additional_instructions || "";
     if (userPreviewGuidance) {
@@ -726,8 +812,9 @@ Respond ONLY with valid JSON matching this schema:
       return res.status(400).json({ error: "Source contains no files or code to convert." });
     }
 
-    // Strict Logical Mismatch Validation
+    // Strict Logical Mismatch Validation (Only applies in full project mode)
     if (
+      isProject &&
       isPureBackendSource(fileList, source_language) &&
       isTargetBackendNone(target_backend) &&
       isTargetFrontendUI(target_frontend)
@@ -747,17 +834,16 @@ Respond ONLY with valid JSON matching this schema:
       ""
     ).toString().trim();
 
-    const effectiveKey = (userApiKey || process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || "").replace(/^["']|["']$/g, "").trim();
+    const candidateKeys = getCandidateApiKeys(userApiKey);
 
-    if (!effectiveKey) {
+    if (candidateKeys.length === 0) {
       return res.status(401).json({
         error: "Invalid API Key. Please check your key and try again.",
-        detail: "API Key is missing. Please provide your Gemini API Key in the top navigation bar.",
+        detail: "API Key is missing. Please ensure GEMINI_API_KEY is configured in project settings.",
       });
     }
 
     try {
-      const ai = getGeminiClient(userApiKey);
       const model = resolveGeminiModel();
       const srcLang = source_language || "python";
       const tgtLang = target_language || "javascript";
@@ -801,7 +887,7 @@ ${instructions ? `User Translation Requirements:\n${instructions}\n` : ""}
           ];
         }
 
-        const response = await ai.models.generateContent({
+        const response = await generateContentWithFailover(userApiKey, {
           model,
           contents: geminiContents,
         });
@@ -947,7 +1033,7 @@ ${instructions ? `User Conversion Requirements & Instructions:\n${instructions}`
             geminiContents = promptText;
           }
 
-          const response = await ai.models.generateContent({
+          const response = await generateContentWithFailover(userApiKey, {
             model,
             contents: geminiContents,
           });
@@ -1017,7 +1103,7 @@ ${currentError || currentStderr || "Execution exception encountered"}
 5. At the very end, output:
 @@@ START_CMD: [command] @@@
 `;
-          const response = await ai.models.generateContent({
+          const response = await generateContentWithFailover(userApiKey, {
             model,
             contents: repairPrompt,
           });
@@ -1161,6 +1247,14 @@ ${currentError || currentStderr || "Execution exception encountered"}
 </html>`);
   });
 
+  // Fallback for API routes so they NEVER return HTML
+  app.all("/api/*", (req, res) => {
+    res.status(404).json({
+      error: `API route not found: ${req.method} ${req.path}`,
+      detail: "The requested API endpoint was not found on this server.",
+    });
+  });
+
   // Vite middleware in dev / static in prod
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1175,6 +1269,18 @@ ${currentError || currentStderr || "Execution exception encountered"}
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Global error handler
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("[Global Error]", err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    res.status(err.status || 500).json({
+      error: err.message || "Internal server error",
+      detail: err.stack || err.toString(),
+    });
+  });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Code Converter server running on http://0.0.0.0:${PORT}`);

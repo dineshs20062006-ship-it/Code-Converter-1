@@ -6,7 +6,6 @@ import {
   Play,
   RotateCcw,
   Sparkles,
-  Key,
   FolderTree,
   FileCode2,
   Copy,
@@ -61,7 +60,6 @@ import { FrontendPreviewConfig } from "../../src/components/FrontendPreviewConfi
 import { ProjectAnalysisBanner } from "../../src/components/ProjectAnalysisBanner";
 import { TerminalPanel } from "../../src/components/TerminalPanel";
 import { UploadZone } from "../../src/components/UploadZone";
-import { ApiKeyModal } from "../../src/components/ApiKeyModal";
 import { ScopeConfirmationModal, TranslationScope } from "../../src/components/ScopeConfirmationModal";
 import { InteractiveLandingPage } from "../../src/components/InteractiveLandingPage";
 
@@ -128,8 +126,6 @@ export default function CodeConverterApp() {
   const [hasCopiedOutput, setHasCopiedOutput] = useState<boolean>(false);
 
   // Modals & Settings
-  const [apiKeyModalOpen, setApiKeyModalOpen] = useState<boolean>(false);
-  const [userApiKey, setUserApiKey] = useState<string>("");
   const [backendHealth, setBackendHealth] = useState<any>(null);
 
   // Scope confirmation modal
@@ -185,16 +181,8 @@ export default function CodeConverterApp() {
     window.addEventListener("mouseup", onMouseUp);
   };
 
-  // Load API key from local storage and verify server health
+  // Verify server health
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      const storedKey =
-        localStorage.getItem("gemini_api_key") ||
-        localStorage.getItem("user_gemini_api_key") ||
-        "";
-      if (storedKey) setUserApiKey(storedKey);
-    }
-
     fetch("/api/health")
       .then((res) => res.json())
       .then((data) => setBackendHealth(data))
@@ -261,7 +249,6 @@ export default function CodeConverterApp() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-gemini-api-key": userApiKey,
         },
         body: JSON.stringify({ files }),
       });
@@ -432,7 +419,6 @@ export default function CodeConverterApp() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-gemini-api-key": userApiKey,
         },
         body: JSON.stringify({
           files: filesToSend,
@@ -472,16 +458,30 @@ export default function CodeConverterApp() {
         }),
       });
 
-      const data: TranslationResponse & { error?: string; detail?: string } = await res.json();
+      let data: (TranslationResponse & { error?: string; detail?: string }) | null = null;
+      const rawText = await res.text();
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        const cleanSnippet = rawText.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+        data = {
+          success: false,
+          error: `Server responded with HTTP ${res.status} (${res.statusText || "Error"})`,
+          detail: cleanSnippet || "The server returned an unexpected response. If the container is cold-starting, please retry in a few seconds.",
+          translated_files: [],
+          final_code: "",
+          total_duration: 0,
+          attempts_used: 1,
+          max_attempts: 1,
+          history: [],
+          terminal_output: "",
+        };
+      }
 
-      if (!res.ok || data.error) {
-        setTerminalOutput(
-          (prev) =>
-            `${prev}\n\n[ERROR]: ${data.error || "Translation request failed."}\n${data.detail || ""}`
-        );
-        if (data.error?.includes("API Key")) {
-          setApiKeyModalOpen(true);
-        }
+      if (!res.ok || data?.error) {
+        const errorMsg = data?.error || `Request failed with status ${res.status}`;
+        const detailMsg = data?.detail ? `\n${data.detail}` : "";
+        setTerminalOutput((prev) => `${prev}\n\n[Pipeline Error]: ${errorMsg}${detailMsg}`);
         return;
       }
 
@@ -714,21 +714,6 @@ export default function CodeConverterApp() {
           >
             <UploadCloud className="w-3.5 h-3.5 text-cyan-400" />
             <span className="hidden sm:inline">New Upload</span>
-          </button>
-
-          {/* API Key Button */}
-          <button
-            id="open-api-key-modal-btn"
-            onClick={() => setApiKeyModalOpen(true)}
-            title="Configure Gemini API Key"
-            className={`flex items-center gap-1.5 px-2 py-1 rounded-lg border text-xs font-medium transition-all cursor-pointer ${
-              userApiKey
-                ? "bg-emerald-950/30 border-emerald-600/30 text-emerald-400 hover:bg-emerald-900/40"
-                : "bg-amber-950/30 border-amber-600/30 text-amber-300 hover:bg-amber-900/40"
-            }`}
-          >
-            <Key className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">{userApiKey ? "Key Active" : "Set Key"}</span>
           </button>
 
           {/* PRIMARY ACTION: Convert & Run */}
@@ -1191,13 +1176,6 @@ export default function CodeConverterApp() {
       {/* ========================================================================= */}
       {/* MODALS & DIALOGS                                                          */}
       {/* ========================================================================= */}
-      <ApiKeyModal
-        isOpen={apiKeyModalOpen}
-        onClose={() => setApiKeyModalOpen(false)}
-        currentKey={userApiKey}
-        onSave={(key) => setUserApiKey(key)}
-      />
-
       <ScopeConfirmationModal
         isOpen={scopeModalOpen}
         classification={pendingClassification}
